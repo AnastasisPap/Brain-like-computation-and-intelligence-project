@@ -62,7 +62,8 @@ def get_feat_rows(feat_path, layer_key, neural_ids):
 def plot_mean_eeg_heatmap(eeg_path, subject, roi, 
                            threshold_zscore=2.5, 
                            percentile_abs=99.11,
-                           channel_threshold=0.10):
+                           channel_threshold=0.10,
+                           save_path=None):
     
     with h5py.File(eeg_path, "r") as f:
         data = f[f"train/neural_data/{subject}/{roi}"][:]
@@ -95,11 +96,13 @@ def plot_mean_eeg_heatmap(eeg_path, subject, roi,
     im = ax.imshow(clean_mean_filtered, aspect="auto", cmap="RdBu_r",
                    interpolation="nearest",
                    extent=[0, 0.8, clean_mean_filtered.shape[0], 0])
-    ax.axvline(x=0, color="black", linewidth=1, linestyle="--", label="Stimulus onset")
+    # ax.axvline(x=0, color="black", linewidth=1, linestyle="--", label="Stimulus onset")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Channel index (clean channels only)")
     ax.set_title(f"Mean EEG response — {subject} / {roi} (clean channels only)")
     plt.colorbar(im, ax=ax, label="Mean amplitude")
     ax.legend()
     plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
