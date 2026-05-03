@@ -466,3 +466,8 @@ class CenteredKernelAlignment:
 
         denom = np.sqrt(hsic_xx * hsic_yy)
         return float(hsic_xy / (denom + self.eps))
+
+def safe_normalize(feats):
+    feats = np.asarray(feats, dtype=np.float64)
+    norms = np.linalg.norm(feats, axis=1, keepdims=True)
+    return feats / (norms + 1e-12)
