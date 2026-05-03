@@ -106,3 +106,202 @@ def plot_mean_eeg_heatmap(eeg_path, subject, roi,
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
+
+def compute_ceiling_variancebased(
+    responses: np.ndarray,
+    nan_policy: str = "omit",
+) -> np.ndarray:
+    """
+    Variance-based noise ceiling (Allen et al. 2022 style).
+ 
+    Input
+    -----
+    responses : (n_channels, n_timepoints, n_stimuli, n_reps)
+        or  (n_units, n_stimuli, n_reps)
+ 
+    Steps
+    -----
+    1. z-score across stimuli (axis=-2) for each (unit, rep).
+    2. Noise variance = var across reps (ddof=1), averaged over stimuli.
+    3. Signal variance = max(1 − noise_var, 0).
+    4. SNR = signal_var / noise_var.
+    5. nc (%) = 100 · SNR / (SNR + 1 / n_reps).
+ 
+    Returns
+    -------
+    nc : (n_channels, n_timepoints) or (n_units,)  in percent [0, 100]
+    """
+    R = np.asarray(responses, dtype=np.float64)
+    # last two axes are always (..., n_stimuli, n_reps)
+    n_reps = R.shape[-1]
+ 
+    # z-score across stimuli for each (unit, rep) — axis=-2
+    mu = R.mean(axis=-2, keepdims=True)
+    sd = R.std(axis=-2, keepdims=True)
+    if nan_policy == "omit":
+        mu = np.nanmean(R, axis=-2, keepdims=True)
+        sd = np.nanstd(R, axis=-2, keepdims=True)
+    Rz = (R - mu) / (sd + 1e-12)
+ 
+    # noise variance: var across reps, then mean across stimuli
+    noise_var = np.nanvar(Rz, axis=-1, ddof=1).mean(axis=-1)   # drop stim & rep axes
+    signal_var = np.maximum(1.0 - noise_var, 0.0)
+ 
+    snr = signal_var / (noise_var + 1e-12)
+    nc = 100.0 * snr / (snr + 1.0 / n_reps)
+    return nc
+ 
+ 
+def compute_ceiling_splithalf(
+    responses: np.ndarray,
+    folds: int = 10,
+    seed: int = 0,
+    spearman_brown: bool = True,
+    equalize_halves: bool = True,
+    clip_folds: bool = False,
+) -> np.ndarray:
+    """
+    Split-half reliability (van Bree et al. 2025).
+ 
+    Input
+    -----
+    responses : (n_channels, n_timepoints, n_stimuli, n_reps)
+        or  (n_units, n_stimuli, n_reps)
+ 
+    Steps
+    -----
+    1. Randomly split reps into two equal halves (drop one if n_reps is odd).
+    2. Average each half over reps → two response matrices over stimuli.
+    3. Pearson r across stimuli for each unit.
+    4. Spearman-Brown correction: r_sb = 2r / (1 + r).
+    5. Average across folds.
+ 
+    Returns
+    -------
+    nc : (n_channels, n_timepoints) or (n_units,)  in [0, 1]
+    """
+    R = np.asarray(responses, dtype=np.float64)
+    n_reps = R.shape[-1]
+    half = n_reps // 2          # always equal halves (drop last rep if odd)
+    rng  = np.random.default_rng(seed)
+ 
+    fold_results = []
+    for f in range(folds):
+        idx = rng.permutation(n_reps)
+        if equalize_halves:
+            h1_idx = idx[:half]
+            h2_idx = idx[half : 2 * half]
+        else:
+            h1_idx = idx[:half]
+            h2_idx = idx[half:]
+ 
+        h1 = R[..., h1_idx].mean(axis=-1)   # (..., n_stimuli)
+        h2 = R[..., h2_idx].mean(axis=-1)
+ 
+        # Pearson r across stimuli (axis=-1) for every unit
+        h1c = h1 - h1.mean(axis=-1, keepdims=True)
+        h2c = h2 - h2.mean(axis=-1, keepdims=True)
+        num  = (h1c * h2c).sum(axis=-1)
+        den  = np.sqrt((h1c**2).sum(axis=-1) * (h2c**2).sum(axis=-1)) + 1e-12
+        r    = num / den
+ 
+        if spearman_brown:
+            r = 2.0 * r / (1.0 + np.abs(r) + 1e-12)  # |r| in denominator for stability
+ 
+        if clip_folds:
+            r = np.clip(r, 0.0, 1.0)
+ 
+        fold_results.append(r)
+ 
+    nc = np.array(fold_results).mean(axis=0)
+    return np.clip(nc, 0.0, 1.0)
+
+def compute_ceiling_variancebased_clean(
+    responses: np.ndarray,
+    nan_policy: str = "omit",
+) -> np.ndarray:
+    """
+    Nan-safe version of compute_ceiling_variancebased.
+    Use this when responses contain NaN entries from QC masking.
+    The key fix is using np.nanmean instead of .mean() when averaging
+    noise variance across stimuli, so channels with partial NaN entries
+    still produce a valid estimate rather than propagating NaN.
+    """
+    R = np.asarray(responses, dtype=np.float64)
+    n_reps = R.shape[-1]
+
+    # z-score across stimuli for each (unit, rep) — always nan-safe
+    mu = np.nanmean(R, axis=-2, keepdims=True)
+    sd = np.nanstd(R, axis=-2, keepdims=True)
+    Rz = (R - mu) / (sd + 1e-12)
+
+    # noise variance: nanvar across reps, then nanmean across stimuli
+    noise_var = np.nanvar(Rz, axis=-1, ddof=1)   # (..., n_stimuli)
+    noise_var = np.nanmean(noise_var, axis=-1)    # (...,)  — KEY FIX
+    signal_var = np.maximum(1.0 - noise_var, 0.0)
+
+    snr = signal_var / (noise_var + 1e-12)
+    # effective n_reps per unit — count non-NaN reps averaged over stimuli
+    n_valid = (~np.isnan(R)).sum(axis=-1).mean(axis=-1)  # (...) mean over stimuli
+    n_valid = np.maximum(n_valid, 1.0)                    # avoid division by zero
+    
+    snr = signal_var / (noise_var + 1e-12)
+    nc = 100.0 * snr / (snr + 1.0 / n_valid)
+    return nc
+
+
+def compute_ceiling_splithalf_clean(
+    responses: np.ndarray,
+    folds: int = 10,
+    seed: int = 0,
+    spearman_brown: bool = True,
+    equalize_halves: bool = True,
+    clip_folds: bool = False,
+) -> np.ndarray:
+    """
+    Nan-safe version of compute_ceiling_splithalf.
+    Use this when responses contain NaN entries from QC masking.
+    The key fixes are:
+    1. np.nanmean instead of .mean() when averaging over repetitions
+       within each half, so a single NaN rep does not corrupt the half-average.
+    2. np.nanmean instead of .mean() for the centering step in Pearson r,
+       so NaN stimuli do not propagate into the correlation.
+    3. np.nanmean instead of .mean() when averaging fold results.
+    """
+    R = np.asarray(responses, dtype=np.float64)
+    n_reps = R.shape[-1]
+    half = n_reps // 2
+    rng = np.random.default_rng(seed)
+
+    fold_results = []
+    for f in range(folds):
+        idx = rng.permutation(n_reps)
+        if equalize_halves:
+            h1_idx = idx[:half]
+            h2_idx = idx[half : 2 * half]
+        else:
+            h1_idx = idx[:half]
+            h2_idx = idx[half:]
+
+        # KEY FIX 1: nanmean over repetitions within each half
+        h1 = np.nanmean(R[..., h1_idx], axis=-1)   # (..., n_stimuli)
+        h2 = np.nanmean(R[..., h2_idx], axis=-1)
+
+        # KEY FIX 2: nanmean for centering in Pearson r
+        h1c = h1 - np.nanmean(h1, axis=-1, keepdims=True)
+        h2c = h2 - np.nanmean(h2, axis=-1, keepdims=True)
+        num = np.nansum(h1c * h2c, axis=-1)
+        den = np.sqrt(np.nansum(h1c**2, axis=-1) * np.nansum(h2c**2, axis=-1)) + 1e-12
+        r = num / den
+
+        if spearman_brown:
+            r = 2.0 * r / (1.0 + np.abs(r) + 1e-12)
+
+        if clip_folds:
+            r = np.clip(r, 0.0, 1.0)
+
+        fold_results.append(r)
+
+    # KEY FIX 3: nanmean across folds
+    nc = np.nanmean(np.array(fold_results), axis=0)
+    return np.clip(nc, 0.0, 1.0)
