@@ -6,6 +6,10 @@ Covers HDF5 inspection and stimulus-to-feature index matching.
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Literal
+import numpy as np
+from scipy import stats
+from scipy.spatial.distance import pdist, squareform
 
 def inspect_h5(path, max_depth=2, _prefix="", _depth=0):
     """
@@ -305,3 +309,160 @@ def compute_ceiling_splithalf_clean(
     # KEY FIX 3: nanmean across folds
     nc = np.nanmean(np.array(fold_results), axis=0)
     return np.clip(nc, 0.0, 1.0)
+
+class RepresentationalSimilarityAnalysis:
+    """
+    Representational Similarity Analysis (RSA).
+
+    Given two representation matrices X and Y with the same number of conditions
+    (rows), RSA:
+    1. Computes a Representational Dissimilarity Matrix (RDM) for each:
+       RDM_X[i, j] = dissimilarity(x_i, x_j)
+       RDM_Y[i, j] = dissimilarity(y_i, y_j)
+    2. Flattens the upper triangles of both RDMs and computes a correlation
+       between them (Pearson or Spearman).
+    """
+
+    def __init__(
+        self,
+        dissimilarity: Literal["correlation", "euclidean", "cosine"] = "correlation",
+        similarity_metric: Literal["pearson", "spearman"] = "spearman",
+    ):
+        self.dissimilarity = dissimilarity
+        self.similarity_metric = similarity_metric
+
+    def __call__(self, X: np.ndarray, Y: np.ndarray) -> float:
+        return self.forward(X, Y)
+
+    def forward(self, X: np.ndarray, Y: np.ndarray) -> float:
+        # flatten to (n_conditions, n_features)
+        X = np.asarray(X, dtype=np.float64).reshape(X.shape[0], -1)
+        Y = np.asarray(Y, dtype=np.float64).reshape(Y.shape[0], -1)
+
+        rdm_x = self.compute_rdm(X)
+        rdm_y = self.compute_rdm(Y)
+
+        return self.compare_rdms(rdm_x, rdm_y)
+
+    def compute_rdm(self, X: np.ndarray) -> np.ndarray:
+        """
+        Compute the Representational Dissimilarity Matrix (RDM)
+        for a given representation matrix X.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Array of shape (n_conditions, n_features).
+
+        Returns
+        -------
+        rdm : np.ndarray
+            Array of shape (n_conditions, n_conditions) with pairwise dissimilarities.
+        """
+        # pdist computes upper triangle distances, squareform makes it symmetric
+        return squareform(pdist(X, metric=self.dissimilarity))
+
+    def compare_rdms(self, rdm1: np.ndarray, rdm2: np.ndarray) -> float:
+        """
+        Compare two RDMs by correlating their upper triangles.
+        """
+        # extract upper triangle indices (excluding diagonal)
+        n = rdm1.shape[0]
+        idx = np.triu_indices(n, k=1)
+        vec1 = rdm1[idx]
+        vec2 = rdm2[idx]
+
+        if self.similarity_metric == "spearman":
+            r, _ = stats.spearmanr(vec1, vec2)
+        else:
+            r, _ = stats.pearsonr(vec1, vec2)
+
+        return float(r)
+
+class CenteredKernelAlignment:
+    """
+    Unbiased linear CKA only.
+
+    Parameters
+    ----------
+    eps : float
+        Small constant for numerical stability.
+    dtype : np.dtype
+        Data type used for computations.
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        dtype: np.dtype = np.float64,
+    ):
+        self.eps = eps
+        self.dtype = dtype
+
+    def __call__(self, X: np.ndarray, Y: np.ndarray) -> float:
+        return self.forward(X, Y)
+
+    def forward(self, X: np.ndarray, Y: np.ndarray) -> float:
+        X = np.asarray(X).astype(self.dtype)
+        Y = np.asarray(Y).astype(self.dtype)
+
+        if X.shape[0] != Y.shape[0]:
+            raise ValueError(
+                f"Batch sizes must match along axis 0: {X.shape[0]} vs {Y.shape[0]}"
+            )
+
+        # Flatten to (n_samples, n_features)
+        X = X.reshape(X.shape[0], -1)
+        Y = Y.reshape(Y.shape[0], -1)
+
+        return self._unbiased_linear_cka(X, Y)
+
+    def _unbiased_linear_hsic(self, X: np.ndarray, Y: np.ndarray) -> float:
+        """
+        Unbiased HSIC estimator for the linear kernel.
+
+        Uses the U-statistic estimator from Song et al. (2012):
+            HSIC_u(K, L) = 1/(n(n-3)) * [tr(KL) + 1'KL1/(n-1)(n-2)
+                           - 2/(n-2) * 1'KL1]
+        
+        Simplified using the fact that for linear kernels K = XX', L = YY':
+            HSIC_u(X, Y) = 1/(n(n-3)) * [||X'Y||_F^2 + (1'K1)(1'L1)/(n-1)(n-2)
+                           - 2/(n-2) * sum_i (x_i'Y)(Y'x_i)]
+
+        We use the cleaner formulation directly on the Gram matrices.
+
+        X : [n, d_x]
+        Y : [n, d_y]
+        """
+        n = X.shape[0]
+
+        # Compute Gram matrices
+        K = X @ X.T  # (n, n)
+        L = Y @ Y.T  # (n, n)
+
+        # Zero out diagonals for unbiased estimator
+        np.fill_diagonal(K, 0)
+        np.fill_diagonal(L, 0)
+
+        # Unbiased HSIC estimator (Kornblith et al. 2019)
+        KL = K @ L
+        hsic = (
+            np.trace(KL)
+            + K.sum() * L.sum() / ((n - 1) * (n - 2))
+            - 2 * KL.sum() / (n - 2)
+        ) / (n * (n - 3))
+
+        return float(hsic)
+
+    def _unbiased_linear_cka(self, X: np.ndarray, Y: np.ndarray) -> float:
+        """
+        Unbiased linear CKA:
+            CKA_unb(X, Y) =
+                HSIC_unb(X, Y) / sqrt(HSIC_unb(X, X) * HSIC_unb(Y, Y))
+        """
+        hsic_xy = self._unbiased_linear_hsic(X, Y)
+        hsic_xx = self._unbiased_linear_hsic(X, X)
+        hsic_yy = self._unbiased_linear_hsic(Y, Y)
+
+        denom = np.sqrt(hsic_xx * hsic_yy)
+        return float(hsic_xy / (denom + self.eps))
