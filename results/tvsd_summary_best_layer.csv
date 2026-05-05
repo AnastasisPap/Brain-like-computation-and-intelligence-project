@@ -1,0 +1,7 @@
+ROI,model,best_RSA,RSA_layer,RSA_depth,best_CKA,CKA_layer,CKA_depth
+IT,Qwen3-VL,0.086,visual-blocks-22,0.556,0.129,language_model-layers-11,0.889
+IT,ResNet152,0.223,layer4-1,1.0,0.252,layer3-25,0.778
+V1,Qwen3-VL,0.105,visual-blocks-6,0.111,0.159,visual-blocks-2,0.0
+V1,ResNet152,0.198,layer3-0,0.222,0.362,layer2-0,0.111
+V4,Qwen3-VL,0.068,visual-blocks-22,0.556,0.106,language_model-layers-3,0.667
+V4,ResNet152,0.232,layer3-0,0.222,0.281,layer3-0,0.222
